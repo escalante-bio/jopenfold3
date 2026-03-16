@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jopenfold3"
+version = "0.1.0"
+description = "OpenFold3 JAX/Equinox translation"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { text = "MIT" }
+dependencies = [
+    "biotite>=1.2",
+    "awscrt",
+    "boto3",
+    "click",
+    "einops",
+    "equinox>=0.13.6",
+    "func-timeout",
+    "gemmi>=0.7",
+    "ijson",
+    "jax[cuda12]>=0.9.1",
+    "kalign-python",
+    "jaxtyping>=0.3.9",
+    "lmdb",
+    "memory-profiler",
+    "ml-collections",
+    "numpy",
+    "packaging",
+    "pandas",
+    "pdbeccdutils",
+    "pydantic",
+    "pytorch-lightning>=2.1",
+    "pyyaml",
+    "rdkit",
+    "requests",
+    "scipy",
+    "torch>=2.5",
+    "tqdm",
+    "typing-extensions",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["jopenfold3"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = [
+    "F722",  # jaxtyping annotations (e.g. Float[Array, "B N"])
+    "F821",  # jaxtyping dimension names (e.g. "Out" in Float[Array, "Out"])
+    "E501",  # line length (handled by formatter)
+    "E741",  # ambiguous variable names (i, l, O common in math code)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # re-exports
+"jopenfold3/primitives/linear.py" = ["E402"]  # register call after class def

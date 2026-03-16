@@ -1,0 +1,748 @@
+# Copyright 2026 AlQuraishi Laboratory
+# Copyright 2021 DeepMind Technologies Limited
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Triangle multiplicative update layers. Includes TriangleMultiplicativeUpdate from AF2
+and FusedTriangleMultiplicativeUpdate from AF2-Multimer.
+"""
+
+import warnings
+from abc import ABC, abstractmethod
+from functools import partialmethod
+
+import torch
+import torch.nn as nn
+
+import jopenfold3._vendor.openfold3.core.config.default_linear_init_config as lin_init
+from jopenfold3._vendor.openfold3.core.kernels.cueq_utils import is_cuequivariance_available
+from jopenfold3._vendor.openfold3.core.model.primitives import LayerNorm, Linear
+from jopenfold3._vendor.openfold3.core.utils.tensor_utils import permute_final_dims
+
+if is_cuequivariance_available():
+    from cuequivariance_torch import triangle_multiplicative_update
+
+
+warnings.filterwarnings("once")
+
+
+class BaseTriangleMultiplicativeUpdate(nn.Module, ABC):
+    """
+    Common base class for TriangleMultiplicativeUpdate and
+    FusedTriangleMultiplicativeUpdate.
+    """
+
+    @abstractmethod
+    def __init__(
+        self, c_z, c_hidden, _outgoing, linear_init_params=lin_init.tri_mul_init
+    ):
+        """
+        Args:
+            c_z:
+                Input channel dimension
+            c:
+                Hidden channel dimension
+        """
+        super().__init__()
+        self.c_z = c_z
+        self.c_hidden = c_hidden
+        self._outgoing = _outgoing
+
+        self.linear_g = Linear(self.c_z, self.c_z, **linear_init_params.linear_g)
+        self.linear_z = Linear(self.c_hidden, self.c_z, **linear_init_params.linear_z)
+
+        self.layer_norm_in = LayerNorm(self.c_z)
+        self.layer_norm_out = LayerNorm(self.c_hidden)
+
+        self.sigmoid = nn.Sigmoid()
+
+    def _combine_projections(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        _inplace_chunk_size: int | None = None,
+    ) -> torch.Tensor:
+        if self._outgoing:
+            a = permute_final_dims(a, (2, 0, 1))
+            b = permute_final_dims(b, (2, 1, 0))
+        else:
+            a = permute_final_dims(a, (2, 1, 0))
+            b = permute_final_dims(b, (2, 0, 1))
+
+        if _inplace_chunk_size is not None:
+            # To be replaced by torch vmap
+            for i in range(0, a.shape[-3], _inplace_chunk_size):
+                a_chunk = a[..., i : i + _inplace_chunk_size, :, :]
+                b_chunk = b[..., i : i + _inplace_chunk_size, :, :]
+                a[..., i : i + _inplace_chunk_size, :, :] = torch.einsum(
+                    "...ij,...jk->...ik", a_chunk, b_chunk
+                )
+
+            p = a
+        else:
+            p = torch.einsum("...ij,...jk->...ik", a, b)
+
+        return permute_final_dims(p, (1, 2, 0))
+
+    @abstractmethod
+    def forward(
+        self,
+        z: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        inplace_safe: bool = False,
+        _add_with_inplace: bool = False,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x:
+                [*, N_res, N_res, C_z] input tensor
+            mask:
+                [*, N_res, N_res] input mask
+        Returns:
+            [*, N_res, N_res, C_z] output tensor
+        """
+        pass
+
+
+class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
+    """
+    Implements AF2 Algorithms 11 and 12 / AF3 Algorithms 12 and 13.
+    """
+
+    def __init__(
+        self, c_z, c_hidden, _outgoing=True, linear_init_params=lin_init.tri_mul_init
+    ):
+        """
+        Args:
+            c_z:
+                Input channel dimension
+            c:
+                Hidden channel dimension
+        """
+        super().__init__(
+            c_z=c_z,
+            c_hidden=c_hidden,
+            _outgoing=_outgoing,
+            linear_init_params=linear_init_params,
+        )
+
+        self.linear_a_p = Linear(
+            self.c_z, self.c_hidden, **linear_init_params.linear_a_p
+        )
+        self.linear_a_g = Linear(
+            self.c_z, self.c_hidden, **linear_init_params.linear_a_g
+        )
+        self.linear_b_p = Linear(
+            self.c_z, self.c_hidden, **linear_init_params.linear_b_p
+        )
+        self.linear_b_g = Linear(
+            self.c_z, self.c_hidden, **linear_init_params.linear_b_g
+        )
+
+    def _inference_forward(
+        self,
+        z: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        inplace_chunk_size: int | None = None,
+        with_add: bool = True,
+    ):
+        """
+        Args:
+            z:
+                A [*, N, N, C_z] pair representation
+            mask:
+                A [*, N, N] pair mask
+            inplace_chunk_size:
+                Size of chunks used in the main computation. Increase to trade
+                memory for speed.
+            with_add:
+                If True, z is overwritten with (z + update). Otherwise, it is
+                overwritten with (update).
+        Returns:
+            A reference to the overwritten z
+
+        More memory-efficient, inference-only version of the forward function.
+        Uses in-place operations, fusion of the addition that happens after
+        this module in the Evoformer, a smidge of recomputation, and
+        a cache of overwritten values to lower peak memory consumption of this
+        module from 5x the size of the input tensor z to 2.5x its size. Useful
+        for inference on extremely long sequences.
+
+        It works as follows. We will make reference to variables used in the
+        default forward implementation below. Naively, triangle multiplication
+        attention requires the manifestation of 5 tensors the size of z:
+        1) z, the "square" input tensor, 2) a, the first projection of z,
+        3) b, the second projection of b, 4) g, a z-sized mask, and 5) a
+        z-sized tensor for intermediate computations. For large N, this is
+        prohibitively expensive; for N=4000, for example, z is more than 8GB
+        alone. To avoid this problem, we compute b, g, and all intermediate
+        tensors in small chunks, noting that the chunks required to compute a
+        chunk of the output depend only on the tensor a and corresponding
+        vertical and horizontal chunks of z. This suggests an algorithm that
+        loops over pairs of chunks of z: hereafter "columns" and "rows" of
+        z, even though each "column" and "row" in fact contains
+        inplace_chunk_size contiguous true columns and rows of z. Writing
+        output chunks to a new tensor would bring total memory consumption
+        down to 3x the size of z. However, more memory can be saved by writing
+        output chunks directly to z in-place. WLOG, we choose to write output
+        chunks vertically, overwriting the ith "column" of z at the end of
+        the ith iteration of the main loop. Despite this overwriting, the
+        ith column is always one column ahead of previously overwritten columns
+        and can be recovered directly from z. After the first iteration,
+        however, the ith row of z is always at least partially overwritten. For
+        this reason, we introduce the z-cache, a tensor one-half the size of
+        z. The z-cache initially contains the left half (2nd and 3rd quadrants)
+        of z. For 0 < i < N/2, the missing left part of the ith row of z is
+        recovered from this cache at the beginning of the ith iteration. Once i
+        exceeds n/2, the cache is "reoriented" to encompass the 3rd and 4th
+        quadrants of z instead. Though the 3rd quadrant of the original z is
+        entirely overwritten at this point, it can be recovered from the z-cache
+        itself. Thereafter, the ith row of z can be recovered in its entirety
+        from the reoriented z-cache. After the final iteration, z has been
+        completely overwritten and contains the triangular multiplicative
+        update. If with_add is True, it instead contains the sum of z and the
+        triangular multiplicative update. In either case, peak memory
+        consumption is just 2.5x the size of z, disregarding memory used for
+        chunks and other small variables.
+        """
+        if mask is None:
+            mask = z.new_ones(z.shape[:-1])
+
+        mask = mask.unsqueeze(-1)
+
+        def compute_projection_helper(pair, mask, a=True):
+            if a:
+                linear_g = self.linear_a_g
+                linear_p = self.linear_a_p
+            else:
+                linear_g = self.linear_b_g
+                linear_p = self.linear_b_p
+
+            pair = self.layer_norm_in(pair)
+            p = linear_g(pair)
+            p.sigmoid_()
+            p *= linear_p(pair)
+            p *= mask
+            p = permute_final_dims(p, (2, 0, 1))
+            return p
+
+        def compute_projection(pair, mask, a=True, chunked=True):
+            need_transpose = self._outgoing ^ a
+            if not chunked:
+                p = compute_projection_helper(pair, mask, a)
+                if need_transpose:
+                    p = p.transpose(-1, -2)
+            else:
+                # This computation is chunked so as not to exceed our 2.5x
+                # budget with a large intermediate tensor
+                linear_g = self.linear_a_g if a else self.linear_b_g
+                c = linear_g.weight.shape[-2]
+                out_shape = pair.shape[:-3] + (c,) + pair.shape[-3:-1]
+                p = pair.new_zeros(out_shape)
+                for i in range(0, pair.shape[-3], inplace_chunk_size):
+                    pair_chunk = compute_projection_helper(
+                        pair[..., i : i + inplace_chunk_size, :, :],
+                        mask[..., i : i + inplace_chunk_size, :, :],
+                        a,
+                    )
+                    if need_transpose:
+                        pair_chunk = pair_chunk.transpose(-1, -2)
+                        p[..., i : i + inplace_chunk_size] = pair_chunk
+                    else:
+                        p[..., i : i + inplace_chunk_size, :] = pair_chunk
+
+                    del pair_chunk
+
+            return p
+
+        # We start by fully manifesting a. In addition to the input, this
+        # brings total memory consumption to 2x z (disregarding size of chunks)
+        # [*, N, N, c]
+        a = compute_projection(z, mask, True, chunked=True)
+
+        if inplace_chunk_size is not None:
+            n = a.shape[-1]
+            half_n = n // 2 + n % 2
+            row_dim = -3
+            col_dim = -2
+            b_chunk_dim = row_dim if self._outgoing else col_dim
+
+            def empty_slicer(t):
+                return [slice(None) for _ in t.shape]
+
+            def slice_tensor(t, start, end, dim):
+                # Slices start:end from the dim dimension of t
+                s = empty_slicer(t)
+                s[dim] = slice(start, end)
+                return t[tuple(s)]
+
+            def flip_z_cache_(z_cache, z):
+                # "Reorient" the z_cache (see below), filling it with quadrants
+                # 3---recovered from the z_cache---and 4---recovered from z---
+                # of the input tensor z.
+                quadrant_3 = slice_tensor(z_cache, half_n, None, row_dim)
+                z_cache = z_cache.transpose(row_dim, col_dim)
+
+                # If n is odd, we need to shrink the z_cache by one row
+                z_cache = z_cache[..., : (n // 2), :, :]
+
+                # Move the 3rd quadrant of z into the
+                first_half_slicer = empty_slicer(z_cache)
+                first_half_slicer[col_dim] = slice(0, half_n)
+                z_cache[tuple(first_half_slicer)] = quadrant_3
+
+                # Get the fourth quadrant of z
+                quadrant_4 = slice_tensor(z, half_n, None, row_dim)
+                quadrant_4 = slice_tensor(quadrant_4, half_n, None, col_dim)
+
+                # Insert said quadrant into the rotated z-cache
+                quadrant_3_slicer = empty_slicer(z_cache)
+                quadrant_3_slicer[col_dim] = slice(half_n, None)
+
+                z_cache[tuple(quadrant_3_slicer)] = quadrant_4
+
+                return z_cache
+
+            # Initialize the z cache to the left half of z.
+            z_cache_shape = list(z.shape)
+            z_cache_shape[col_dim] = half_n
+            z_cache = z.new_zeros(z_cache_shape)
+            z_cache_slicer = empty_slicer(z_cache)
+            z_cache_slicer[col_dim] = slice(0, half_n)
+            z_cache.copy_(z[tuple(z_cache_slicer)])
+            z_cache_rotated = False
+
+            # We need to reorient the z-cache at the halfway point, and we
+            # don't want a single chunk to straddle that point. We contract one
+            # of the chunks in the middle to address that problem.
+            i_range = list(range(0, half_n, inplace_chunk_size))
+            initial_offsets = [
+                i_2 - i_1
+                for i_1, i_2 in zip(i_range, i_range[1:] + [half_n], strict=True)
+            ]
+            after_half = list(range(half_n, n, inplace_chunk_size))
+            after_half_offsets = [inplace_chunk_size for _ in after_half]
+            combined_range_with_offsets = zip(
+                i_range + after_half, initial_offsets + after_half_offsets, strict=False
+            )
+            for i, offset in combined_range_with_offsets:
+                if not z_cache_rotated and i >= half_n:
+                    z_cache = flip_z_cache_(z_cache, z)
+                    z_cache_rotated = True
+
+                z_chunk_b = slice_tensor(
+                    z,
+                    i,
+                    i + offset,
+                    b_chunk_dim,
+                )
+                mask_chunk = slice_tensor(
+                    mask,
+                    i,
+                    i + offset,
+                    b_chunk_dim,
+                )
+
+                z_chunk_b = z_chunk_b.clone()
+                if b_chunk_dim == col_dim:
+                    z_chunk_b = slice_tensor(z, i, i + offset, col_dim)
+                else:  # b_chunk_dim == row_dim
+                    # In this case, the b-dimension (b_chunk_dim) is partially
+                    # overwritten at the end of each iteration. We need to
+                    # restore the missing component from the z-cache.
+                    if not z_cache_rotated:
+                        z_chunk_slicer = empty_slicer(z_chunk_b)
+                        z_chunk_slicer[col_dim] = slice(0, half_n)
+                        z_chunk_b[tuple(z_chunk_slicer)] = slice_tensor(
+                            z_cache,
+                            i,
+                            i + offset,
+                            row_dim,
+                        )
+                    else:
+                        z_cache_offset = i - half_n
+                        z_chunk_b = slice_tensor(
+                            z_cache, z_cache_offset, z_cache_offset + offset, row_dim
+                        )
+
+                b_chunk = compute_projection(
+                    z_chunk_b, mask_chunk, a=False, chunked=False
+                )
+                del z_chunk_b
+
+                x_chunk = torch.einsum("...ij,...jk->...ik", a, b_chunk)
+                x_chunk = permute_final_dims(x_chunk, (1, 2, 0))
+                x_chunk = self.layer_norm_out(x_chunk)
+                x_chunk = self.linear_z(x_chunk)
+
+                # The g dimension (col_dim) is parallel to and ahead of the
+                # overwrites in z. We can extract the g chunk normally.
+                z_chunk_g = slice_tensor(z, i, i + offset, col_dim)
+                g_chunk = self.linear_g(self.layer_norm_in(z_chunk_g))
+                g_chunk.sigmoid_()
+                del z_chunk_g
+
+                x_chunk *= g_chunk
+
+                # Write the columns into z in-place
+                z_slicer = empty_slicer(z)
+                z_slicer[col_dim] = slice(i, i + offset)
+                if with_add:
+                    z[tuple(z_slicer)] += x_chunk
+                else:
+                    z[tuple(z_slicer)] = x_chunk
+        else:
+            b = compute_projection(z, mask, False, False)
+            x = torch.einsum("...ij,...jk->...ik", a, b)
+            x = self.layer_norm_out(x)
+            x = self.linear_z(x)
+            g = self.linear_g(z)
+            g.sigmoid_()
+            x *= g
+            if with_add:
+                z += x
+            else:
+                z = x
+
+        return z
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        inplace_safe: bool = False,
+        use_cueq_triangle_kernels: bool = False,
+        _add_with_inplace: bool = False,
+        _inplace_chunk_size: int | None = 256,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x:
+                [*, N_res, N_res, C_z] input tensor
+            mask:
+                [*, N_res, N_res] input mask
+        Returns:
+            [*, N_res, N_res, C_z] output tensor
+        """
+        ## NOTE: valid for inplace safe and use_cueq_triangle_kernels to be enabled
+        ## inplace safe is used across the codebase and so should not
+        ## be disabled. So if use_cueq_triangle_kernels is True, it will always
+        ## supersede inplace_safe
+        if use_cueq_triangle_kernels:
+            ## VS: The cuequivariance kernel is based on the boltz implementation
+            ## of triangle multiplicative update, which fuses the linear_*_p
+            ## projections into a single layer (similarly for linear_*_g).
+            ## this why we need to concat the projection layers here
+            x = _cueq_triangle_mult(
+                z=z,
+                g_in_weight=torch.cat(
+                    [
+                        self.linear_a_g.weight,
+                        self.linear_b_g.weight,
+                    ]
+                ),
+                p_in_weight=torch.cat(
+                    [
+                        self.linear_a_p.weight,
+                        self.linear_b_p.weight,
+                    ]
+                ),
+                _outgoing=self._outgoing,
+                mask=mask,
+                norm_in_weight=self.layer_norm_in.weight,
+                norm_in_bias=self.layer_norm_in.bias,
+                norm_out_weight=self.layer_norm_out.weight,
+                norm_out_bias=self.layer_norm_out.bias,
+                p_out_weight=self.linear_z.weight,
+                g_out_weight=self.linear_g.weight,
+            )
+            return x
+
+        if inplace_safe:
+            x = self._inference_forward(
+                z,
+                mask,
+                inplace_chunk_size=_inplace_chunk_size,
+                with_add=_add_with_inplace,
+            )
+            return x
+
+        if mask is None:
+            mask = z.new_ones(z.shape[:-1])
+
+        mask = mask.unsqueeze(-1)
+
+        z = self.layer_norm_in(z)
+        a = mask  # (1,s, s, 1)
+        a = a * self.sigmoid(self.linear_a_g(z))
+        a = a * self.linear_a_p(z)
+        b = mask
+        b = b * self.sigmoid(self.linear_b_g(z))
+        b = b * self.linear_b_p(z)
+
+        x = self._combine_projections(a, b)
+
+        del a, b
+        x = self.layer_norm_out(x)
+        x = self.linear_z(x)
+        g = self.sigmoid(self.linear_g(z))
+        x = x * g
+
+        return x
+
+
+class TriangleMultiplicationOutgoing(TriangleMultiplicativeUpdate):
+    """
+    Implements AF2 Algorithm 11 / AF3 Algorithm 12.
+    """
+
+    __init__ = partialmethod(TriangleMultiplicativeUpdate.__init__, _outgoing=True)
+
+
+class TriangleMultiplicationIncoming(TriangleMultiplicativeUpdate):
+    """
+    Implements AF2 Algorithm 12 / AF3 Algorithm 13.
+    """
+
+    __init__ = partialmethod(TriangleMultiplicativeUpdate.__init__, _outgoing=False)
+
+
+class FusedTriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
+    """
+    Implements AF2-Multimer version of AF2 Algorithm 11 and 12.
+    """
+
+    def __init__(
+        self,
+        c_z,
+        c_hidden,
+        _outgoing=True,
+        linear_init_params=lin_init.fused_tri_mul_init,
+    ):
+        """
+        Args:
+            c_z:
+                Input channel dimension
+            c:
+                Hidden channel dimension
+        """
+        super().__init__(
+            c_z=c_z,
+            c_hidden=c_hidden,
+            _outgoing=_outgoing,
+            linear_init_params=linear_init_params,
+        )
+
+        self.linear_ab_p = Linear(
+            self.c_z, self.c_hidden * 2, **linear_init_params.linear_ab_p
+        )
+        self.linear_ab_g = Linear(
+            self.c_z, self.c_hidden * 2, **linear_init_params.linear_ab_g
+        )
+
+    def _inference_forward(
+        self,
+        z: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        _inplace_chunk_size: int | None = None,
+        with_add: bool = True,
+    ):
+        """
+        Args:
+            z:
+                A [*, N, N, C_z] pair representation
+            mask:
+                A [*, N, N] pair mask
+            with_add:
+                If True, z is overwritten with (z + update). Otherwise, it is
+                overwritten with (update).
+        Returns:
+            A reference to the overwritten z
+        """
+        if mask is None:
+            mask = z.new_ones(z.shape[:-1])
+
+        mask = mask.unsqueeze(-1)
+
+        def compute_projection_helper(pair, mask):
+            p = self.linear_ab_g(pair)
+            p.sigmoid_()
+            p *= self.linear_ab_p(pair)
+            p *= mask
+
+            return p
+
+        def compute_projection(pair, mask):
+            p = compute_projection_helper(pair, mask)
+            left = p[..., : self.c_hidden]
+            right = p[..., self.c_hidden :]
+
+            return left, right
+
+        z_norm_in = self.layer_norm_in(z)
+        a, b = compute_projection(z_norm_in, mask)
+        x = self._combine_projections(a, b, _inplace_chunk_size=_inplace_chunk_size)
+        x = self.layer_norm_out(x)
+        x = self.linear_z(x)
+        g = self.linear_g(z_norm_in)
+        g.sigmoid_()
+        x *= g
+        if with_add:
+            z += x
+        else:
+            z = x
+
+        return z
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        inplace_safe: bool = False,
+        use_cueq_triangle_kernels: bool = False,
+        _add_with_inplace: bool = False,
+        _inplace_chunk_size: int | None = 256,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x:
+                [*, N_res, N_res, C_z] input tensor
+            mask:
+                [*, N_res, N_res] input mask
+        Returns:
+            [*, N_res, N_res, C_z] output tensor
+        """
+        # Supersede inplace_safe conditional if cueq kernel is used
+        if use_cueq_triangle_kernels:
+            x = _cueq_triangle_mult(
+                z=z,
+                g_in_weight=self.linear_ab_g.weight,
+                p_in_weight=self.linear_ab_p.weight,
+                _outgoing=self._outgoing,
+                mask=mask,
+                norm_in_weight=self.layer_norm_in.weight,
+                norm_in_bias=self.layer_norm_in.bias,
+                norm_out_weight=self.layer_norm_out.weight,
+                norm_out_bias=self.layer_norm_out.bias,
+                p_out_weight=self.linear_z.weight,
+                g_out_weight=self.linear_g.weight,
+            )
+            return x
+
+        if inplace_safe:
+            x = self._inference_forward(
+                z,
+                mask,
+                _inplace_chunk_size=_inplace_chunk_size,
+                with_add=_add_with_inplace,
+            )
+            return x
+
+        if mask is None:
+            mask = z.new_ones(z.shape[:-1])
+
+        mask = mask.unsqueeze(-1)
+
+        z = self.layer_norm_in(z)
+        ab = mask
+        ab = ab * self.sigmoid(self.linear_ab_g(z))
+        ab = ab * self.linear_ab_p(z)
+
+        a = ab[..., : self.c_hidden]
+        b = ab[..., self.c_hidden :]
+
+        x = self._combine_projections(a, b)
+
+        del a, b
+        x = self.layer_norm_out(x)
+        x = self.linear_z(x)
+        g = self.sigmoid(self.linear_g(z))
+        x = x * g
+
+        return x
+
+
+class FusedTriangleMultiplicationOutgoing(FusedTriangleMultiplicativeUpdate):
+    """
+    Implements AF2-Multimer version of AF2 Algorithm 11.
+    Not compatible with AF3
+    """
+
+    __init__ = partialmethod(FusedTriangleMultiplicativeUpdate.__init__, _outgoing=True)
+
+
+class FusedTriangleMultiplicationIncoming(FusedTriangleMultiplicativeUpdate):
+    """
+    Implements AF2-Multimer version of AF2 Algorithm 12.
+    Not compatible with AF3
+    """
+
+    __init__ = partialmethod(
+        FusedTriangleMultiplicativeUpdate.__init__, _outgoing=False
+    )
+
+
+def _cueq_triangle_mult(
+    z: torch.Tensor,
+    g_in_weight: torch.Tensor,
+    p_in_weight: torch.Tensor,
+    _outgoing: bool,
+    mask: torch.Tensor | None,
+    norm_in_weight: torch.Tensor,
+    norm_in_bias: torch.Tensor,
+    norm_out_weight: torch.Tensor,
+    norm_out_bias: torch.Tensor,
+    p_out_weight: torch.Tensor,
+    g_out_weight: torch.Tensor,
+) -> torch.Tensor:
+    ##VS: similar issue here as to the cueq triangle attention
+    ## kernel, we need to reshape the input so that batch and
+    ## n_tmpl are combined into a single dimension.
+
+    ## only hidden dimension multiple of 32 is supported for now
+    if z.shape[-1] % 32 != 0:
+        raise ValueError(
+            "CUEQ triangle multiplicative update only supports "
+            "channel dimension multiple of 32, got: "
+            f"{z.shape[-1]}"
+        )
+
+    is_batched_input = False
+    if len(z.shape) > 4:
+        assert len(z.shape) == 5, (
+            "CUEQ triangle multiplicative update only supports "
+            f"max 5 input dimensions, got: {len(z.shape)}"
+        )
+        is_batched_input = True
+        batch, n_tmpl, n_res, _, c_in = z.shape
+        z = z.view(batch * n_tmpl, *z.shape[2:])
+        mask = mask.view(batch * n_tmpl, *mask.shape[2:]) if mask is not None else None
+
+    x = triangle_multiplicative_update(
+        z,
+        direction="outgoing" if _outgoing else "incoming",
+        mask=mask,
+        norm_in_weight=norm_in_weight,
+        norm_in_bias=norm_in_bias,
+        g_in_weight=g_in_weight,
+        p_in_weight=p_in_weight,
+        norm_out_weight=norm_out_weight,
+        norm_out_bias=norm_out_bias,
+        p_out_weight=p_out_weight,
+        g_out_weight=g_out_weight,
+        eps=1e-5,
+    )
+    if is_batched_input:
+        x = x.view(batch, n_tmpl, *x.shape[1:])
+    return x

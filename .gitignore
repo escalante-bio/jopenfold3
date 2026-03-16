@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Large data / captures
+*.pkl
+test_save/
+predict_test/
+predictions/
+
+# Development scaffolding (depend on large pkl captures)
+capture_*.py
+test_all_modules.py
+test_primitives.py
+main.py
+
+# PyTorch upstream (separate repo, installed as editable dep)
+pytorch/
