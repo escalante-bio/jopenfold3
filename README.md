@@ -1,6 +1,6 @@
 # OpenFold3-JAX
 
-JAX/Equinox translation of [OpenFold3](https://github.com/aqlaboratory/openfold3) (AlphaFold 3).
+JAX/Equinox translation of [OpenFold3](https://github.com/aqlaboratory/openfold-3) (AlphaFold 3).
 Featurization uses the upstream PyTorch pipeline; the model itself — recycling,
 diffusion sampling, and confidence heads — runs entirely in JAX.
 
@@ -42,4 +42,5 @@ model = OpenFold3.load()  # auto-downloads on first call
 
 ## License
 
-MIT
+The JAX translation is MIT licensed and incorporates OpenFold3 under the terms
+of the Apache 2.0 license. See [NOTICE](NOTICE) for details.

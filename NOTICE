@@ -1,0 +1,13 @@
+The jopenfold3 JAX/Equinox translation is licensed under the MIT License in
+./LICENSE.
+
+This repository also vendors a subset of OpenFold3 under
+jopenfold3/_vendor/openfold3/. That subset is licensed under the Apache 2.0
+license in jopenfold3/_vendor/openfold3/LICENSE.
+
+    OpenFold3 (https://github.com/aqlaboratory/openfold-3)
+    Copyright 2026 AlQuraishi Laboratory
+    Licensed under the Apache License, Version 2.0.
+
+Our copy was modified to run vendored and only retains model definitions and
+data constants.
