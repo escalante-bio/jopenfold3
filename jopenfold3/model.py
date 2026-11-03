@@ -127,6 +127,24 @@ class OpenFold3(eqx.Module):
 
         return s, z
 
+    def init_state(self, init_emb: InitialEmbedding) -> TrunkEmbedding:
+        """The recycled state before the first trunk pass (zeros)."""
+        return TrunkEmbedding(s=jnp.zeros_like(init_emb.s_init), z=jnp.zeros_like(init_emb.z_init))
+
+    def step(self, batch, init_emb: InitialEmbedding, state: TrunkEmbedding, *, key,
+             deterministic=True) -> TrunkEmbedding:
+        """Exactly one trunk pass (template + MSA + pairformer) on the recycled
+        ``state``. ``run_trunk(batch, n, key=key)`` is ``n`` of these from
+        `init_state`, pass ``i`` with ``jax.random.fold_in(k, i)`` where
+        ``_, k = jax.random.split(key)``."""
+        token_mask = batch.token_mask
+        pair_mask = token_mask[..., None] * token_mask[..., None, :]
+        s, z = self._trunk_iteration(
+            batch, init_emb.s_input, init_emb.s_init, init_emb.z_init, token_mask, pair_mask,
+            state.s, state.z, key=key, deterministic=deterministic,
+        )
+        return TrunkEmbedding(s=s, z=z)
+
     def _run_trunk_loop(self, batch, s_input, s_init, z_init, num_cycles,
                         *, key, deterministic=True):
         """Unified trunk loop: all iterations in a single fori_loop.
